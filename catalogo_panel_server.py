@@ -1,6 +1,7 @@
 
 import os
 import re
+import gc
 import uuid
 import tempfile
 from collections import Counter
@@ -69,6 +70,7 @@ def sample_background_color(pagina, rect, ignore_color=None):
     if not colores:
         return (1, 1, 1)
     r, g, b = colores.most_common(1)[0][0]
+    del pix
     return (r / 255, g / 255, b / 255)
 
 
@@ -584,7 +586,13 @@ def convert():
                         width=max(0.6, e["fontsize"] * 0.06),
                     )
 
-        doc.save(output_path, garbage=4, deflate=True)
+            # Liberamos la memoria de la página antes de pasar a la siguiente
+            # (clave en el plan free de 512 MB con catálogos pesados).
+            data = None
+            ediciones = None
+            gc.collect()
+
+        doc.save(output_path, garbage=1, deflate=True)
 
         
         return send_file(output_path, as_attachment=True, download_name="catalogo_guaranies.pdf")
