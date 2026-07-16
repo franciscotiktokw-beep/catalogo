@@ -511,8 +511,10 @@ def convert():
         return send_file(output_path, as_attachment=True, download_name="catalogo_guaranies.pdf")
         
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f"Error procesando PDF: {e}")
-        return "Internal server error during conversion", 500
+        return f"Error procesando PDF: {e}", 500
     finally:
         # Cerramos el documento para liberar el archivo antes de borrarlo
         if doc is not None:
