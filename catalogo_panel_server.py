@@ -1,14 +1,23 @@
 
 import os
 import re
+import uuid
 import tempfile
 from collections import Counter
 from flask import Flask, request, render_template_string, send_file, jsonify
+from werkzeug.utils import secure_filename
+from werkzeug.exceptions import RequestEntityTooLarge
 import fitz  # PyMuPDF
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = tempfile.gettempdir()
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100 MB max
+app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200 MB max
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def _archivo_muy_grande(_e):
+    return ("El PDF supera el tamaño máximo permitido. "
+            "Probá comprimirlo o dividirlo en partes."), 413
 
 
 def color_int_to_rgb(color_int):
@@ -255,91 +264,134 @@ HTML_TEMPLATE = '''
             fileNameDisplay.classList.add('text-blue-400', 'font-medium');
         }
 
+        // Lee los primeros bytes del archivo para confirmar que es un PDF real
+        function leerCabecera(file) {
+            return new Promise((resolve) => {
+                const reader = new FileReader();
+                reader.onload = () => {
+                    const arr = new Uint8Array(reader.result || new ArrayBuffer(0));
+                    let s = '';
+                    for (let i = 0; i < arr.length; i++) s += String.fromCharCode(arr[i]);
+                    resolve(s);
+                };
+                reader.onerror = () => resolve('');
+                reader.readAsArrayBuffer(file.slice(0, 5));
+            });
+        }
+
         form.addEventListener('submit', async (e) => {
             e.preventDefault();
-            if(fileInput.files.length === 0) return alert('Por favor, selecciona un archivo PDF primero.');
+            const file = fileInput.files[0];
+            if (!file) { alert('Elegí un archivo PDF primero.'); return; }
+
+            // Validación LOCAL antes de subir (evita subir archivos pesados en vano)
+            if (!file.name.toLowerCase().endsWith('.pdf')) {
+                alert('El archivo debe tener extensión .pdf');
+                return;
+            }
+            const cabecera = await leerCabecera(file);
+            if (!cabecera.startsWith('%PDF')) {
+                alert('El archivo no parece un PDF válido (no empieza con "%PDF"). Puede estar dañado.');
+                return;
+            }
 
             const formData = new FormData();
-            formData.append('file', fileInput.files[0]);
+            formData.append('file', file);
             formData.append('rate', document.getElementById('rate').value);
 
             statusContainer.classList.remove('hidden');
             submitBtn.disabled = true;
             submitBtn.classList.add('opacity-50', 'cursor-not-allowed');
 
-            try {
-                // Configurar XHR para poder ver el progreso real de subida
-                const xhr = new XMLHttpRequest();
-                xhr.open('POST', '/convert', true);
-                
-                xhr.upload.onprogress = function(e) {
-                    if (e.lengthComputable) {
-                        const percent = Math.round((e.loaded / e.total) * 100);
-                        progressBar.style.width = (percent * 0.4) + '%'; // 40% reservado para subida
-                        statusPercent.textContent = Math.round(percent * 0.4) + '%';
-                        statusText.textContent = 'Subiendo catálogo al servidor...';
-                    }
-                };
+            let processInterval = null;
 
-                xhr.onload = function() {
-                    if (xhr.status === 200) {
-                        progressBar.style.width = '100%';
-                        statusPercent.textContent = '100%';
-                        statusText.textContent = '¡Listo! Descargando tu archivo...';
-                        
-                        // Crear enlace de descarga con el binario recibido
-                        const blob = new Blob([xhr.response], { type: 'application/pdf' });
-                        const link = document.createElement('a');
-                        link.href = window.URL.createObjectURL(blob);
-                        link.download = 'catalogo_pyg.pdf';
-                        document.body.appendChild(link);
-                        link.click();
-                        document.body.removeChild(link);
-                        
-                        setTimeout(resetStatus, 3000);
-                    } else {
-                        alert('Error al procesar el PDF. Por favor verifica el formato del archivo.');
-                        resetStatus();
-                    }
-                };
-
-                xhr.onerror = function() {
-                    alert('Ocurrió un error en la conexión.');
-                    resetStatus();
-                };
-
-                xhr.responseType = 'blob';
-                
-                // Simular el backend procesando (incrementando barra del 40% al 90% mientras esperamos)
-                let processPercent = 40;
-                const interval = setInterval(() => {
-                    if (processPercent < 95) {
-                        processPercent += 5;
-                        progressBar.style.width = processPercent + '%';
-                        statusPercent.textContent = processPercent + '%';
-                        statusText.textContent = 'Procesando coordenadas de precios y sobreescribiendo...';
-                    } else {
-                        clearInterval(interval);
-                    }
-                }, 400);
-
-                xhr.send(formData);
-
-                function resetStatus() {
-                    clearInterval(interval);
-                    statusContainer.classList.add('hidden');
-                    progressBar.style.width = '0%';
-                    statusPercent.textContent = '0%';
-                    submitBtn.disabled = false;
-                    submitBtn.classList.remove('opacity-50', 'cursor-not-allowed');
-                }
-
-            } catch (err) {
-                console.error(err);
-                alert('Ocurrió un error en el envío.');
+            function resetStatus() {
+                if (processInterval) clearInterval(processInterval);
+                statusContainer.classList.add('hidden');
+                progressBar.style.width = '0%';
+                statusPercent.textContent = '0%';
                 submitBtn.disabled = false;
                 submitBtn.classList.remove('opacity-50', 'cursor-not-allowed');
             }
+
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', '/convert', true);
+            xhr.responseType = 'blob';
+            xhr.timeout = 600000; // 10 min de margen para catálogos pesados
+
+            // Progreso REAL de subida (0% a 40%)
+            xhr.upload.onprogress = function(ev) {
+                if (ev.lengthComputable) {
+                    const percent = Math.round((ev.loaded / ev.total) * 100);
+                    progressBar.style.width = (percent * 0.4) + '%';
+                    statusPercent.textContent = Math.round(percent * 0.4) + '%';
+                    const mb = (ev.loaded / 1048576).toFixed(1);
+                    const totalMb = (ev.total / 1048576).toFixed(1);
+                    statusText.textContent = 'Subiendo catálogo... ' + mb + ' / ' + totalMb + ' MB';
+                }
+            };
+
+            // Terminó la subida: ahora el servidor procesa (40% a 95% simulado)
+            xhr.upload.onload = function() {
+                progressBar.style.width = '45%';
+                statusPercent.textContent = '45%';
+                statusText.textContent = 'Procesando precios en el servidor...';
+                let processPercent = 45;
+                processInterval = setInterval(() => {
+                    if (processPercent < 95) {
+                        processPercent += 3;
+                        progressBar.style.width = processPercent + '%';
+                        statusPercent.textContent = processPercent + '%';
+                    } else {
+                        clearInterval(processInterval);
+                    }
+                }, 500);
+            };
+
+            xhr.onload = async function() {
+                if (processInterval) clearInterval(processInterval);
+                const ct = xhr.getResponseHeader('Content-Type') || '';
+                if (xhr.status === 200 && ct.indexOf('application/pdf') !== -1) {
+                    progressBar.style.width = '100%';
+                    statusPercent.textContent = '100%';
+                    statusText.textContent = '¡Listo! Descargando tu archivo...';
+                    const url = window.URL.createObjectURL(xhr.response);
+                    const link = document.createElement('a');
+                    link.href = url;
+                    link.download = 'catalogo_guaranies.pdf';
+                    document.body.appendChild(link);
+                    link.click();
+                    document.body.removeChild(link);
+                    setTimeout(() => window.URL.revokeObjectURL(url), 4000);
+                    setTimeout(resetStatus, 3000);
+                } else {
+                    // Mostramos el mensaje REAL del servidor (no un genérico)
+                    let msg = 'No se pudo procesar el archivo.';
+                    try { msg = (await xhr.response.text()) || msg; } catch (_) {}
+                    if (xhr.status === 413) {
+                        msg = 'El PDF es demasiado grande para el servidor. Probá comprimirlo o dividirlo.';
+                    } else if (xhr.status === 0) {
+                        msg = 'Se cortó la conexión durante la subida. Probá con una conexión más estable.';
+                    }
+                    alert('Error (' + xhr.status + '): ' + msg);
+                    resetStatus();
+                }
+            };
+
+            xhr.onerror = function() {
+                if (processInterval) clearInterval(processInterval);
+                alert('Se interrumpió la conexión con el servidor. Revisá tu internet y volvé a intentar.');
+                resetStatus();
+            };
+
+            xhr.ontimeout = function() {
+                if (processInterval) clearInterval(processInterval);
+                alert('La operación tardó demasiado y se canceló. Probá con un PDF más liviano o mejor conexión.');
+                resetStatus();
+            };
+
+            statusText.textContent = 'Subiendo catálogo...';
+            xhr.send(formData);
         });
     </script>
 </body>
@@ -353,19 +405,46 @@ def home():
 @app.route('/convert', methods=['POST'])
 def convert():
     if 'file' not in request.files:
-        return "No file uploaded", 400
-    
-    file = request.files['file']
-    rate_val = float(request.form.get('rate', 7.80))
-    
-    if file.filename == '':
-        return "No file selected", 400
+        return "No se recibió ningún archivo.", 400
 
-    input_path = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
-    output_path = os.path.join(app.config['UPLOAD_FOLDER'], "converted_" + file.filename)
-    
+    file = request.files['file']
+    if not file or file.filename == '':
+        return "No se seleccionó ningún archivo.", 400
+
+    # Nombre seguro (evita path traversal) y validación de extensión.
+    nombre_seguro = secure_filename(file.filename) or "catalogo.pdf"
+    if not nombre_seguro.lower().endswith('.pdf'):
+        return "El archivo debe ser un PDF (.pdf).", 400
+
+    # Tasa de cambio robusta (acepta coma o punto).
+    try:
+        rate_val = float(str(request.form.get('rate', '7.80')).replace(',', '.'))
+        if rate_val <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        return "La tasa de cambio ingresada no es válida.", 400
+
+    # Nombres únicos: evita colisiones si entran dos subidas a la vez.
+    unico = uuid.uuid4().hex
+    input_path = os.path.join(app.config['UPLOAD_FOLDER'], f"in_{unico}.pdf")
+    output_path = os.path.join(app.config['UPLOAD_FOLDER'], f"out_{unico}.pdf")
+
     file.save(input_path)
-    
+
+    # Validamos que el archivo recibido sea realmente un PDF. Si la subida se
+    # cortó a mitad (conexión inestable), el archivo llega incompleto/corrupto
+    # y lo detectamos acá con un mensaje claro en lugar de un error genérico.
+    try:
+        tam = os.path.getsize(input_path)
+        with open(input_path, 'rb') as fh:
+            cabecera = fh.read(5)
+        if tam == 0 or not cabecera.startswith(b'%PDF'):
+            os.remove(input_path)
+            return ("La subida se cortó o el archivo no es un PDF válido. "
+                    "Volvé a intentarlo con una conexión estable."), 400
+    except OSError:
+        return "No se pudo leer el archivo subido. Intentá de nuevo.", 400
+
     doc = None
     try:
         # Abrimos el PDF original

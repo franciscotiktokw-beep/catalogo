@@ -1,0 +1,20 @@
+# App Flutter (no se sube al repo, solo el servidor Python)
+catalogo_app/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Archivos temporales / PDFs de prueba
+*.pdf
+converted_*.pdf
+
+# Sistema / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
