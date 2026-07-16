@@ -1,24 +1,14 @@
 
 import os
 import re
-import gc
-import uuid
 import tempfile
 from collections import Counter
 from flask import Flask, request, render_template_string, send_file, jsonify
-from werkzeug.utils import secure_filename
-from werkzeug.exceptions import RequestEntityTooLarge
 import fitz  # PyMuPDF
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = tempfile.gettempdir()
-app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200 MB max
-
-
-@app.errorhandler(RequestEntityTooLarge)
-def _archivo_muy_grande(_e):
-    return ("El PDF supera el tamaño máximo permitido. "
-            "Probá comprimirlo o dividirlo en partes."), 413
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100 MB max
 
 
 def color_int_to_rgb(color_int):
@@ -70,7 +60,6 @@ def sample_background_color(pagina, rect, ignore_color=None):
     if not colores:
         return (1, 1, 1)
     r, g, b = colores.most_common(1)[0][0]
-    del pix
     return (r / 255, g / 255, b / 255)
 
 
@@ -118,7 +107,6 @@ HTML_TEMPLATE = '''
                 </div>
             </div>
             <span class="text-xs bg-slate-800 text-slate-300 px-2.5 py-1 rounded-full font-mono">v1.0.0</span>
-            <a href="/local" class="text-xs bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-1.5 rounded-full font-medium ml-2">⚡ Versión local (sin subir)</a>
         </div>
     </header>
 
@@ -267,562 +255,117 @@ HTML_TEMPLATE = '''
             fileNameDisplay.classList.add('text-blue-400', 'font-medium');
         }
 
-        // Lee los primeros bytes del archivo para confirmar que es un PDF real
-        function leerCabecera(file) {
-            return new Promise((resolve) => {
-                const reader = new FileReader();
-                reader.onload = () => {
-                    const arr = new Uint8Array(reader.result || new ArrayBuffer(0));
-                    let s = '';
-                    for (let i = 0; i < arr.length; i++) s += String.fromCharCode(arr[i]);
-                    resolve(s);
-                };
-                reader.onerror = () => resolve('');
-                reader.readAsArrayBuffer(file.slice(0, 5));
-            });
-        }
-
         form.addEventListener('submit', async (e) => {
             e.preventDefault();
-            const file = fileInput.files[0];
-            if (!file) { alert('Elegí un archivo PDF primero.'); return; }
-
-            // Validación LOCAL antes de subir (evita subir archivos pesados en vano)
-            if (!file.name.toLowerCase().endsWith('.pdf')) {
-                alert('El archivo debe tener extensión .pdf');
-                return;
-            }
-            const cabecera = await leerCabecera(file);
-            if (!cabecera.startsWith('%PDF')) {
-                alert('El archivo no parece un PDF válido (no empieza con "%PDF"). Puede estar dañado.');
-                return;
-            }
+            if(fileInput.files.length === 0) return alert('Por favor, selecciona un archivo PDF primero.');
 
             const formData = new FormData();
-            formData.append('file', file);
+            formData.append('file', fileInput.files[0]);
             formData.append('rate', document.getElementById('rate').value);
 
             statusContainer.classList.remove('hidden');
             submitBtn.disabled = true;
             submitBtn.classList.add('opacity-50', 'cursor-not-allowed');
 
-            let processInterval = null;
+            try {
+                // Configurar XHR para poder ver el progreso real de subida
+                const xhr = new XMLHttpRequest();
+                xhr.open('POST', '/convert', true);
+                
+                xhr.upload.onprogress = function(e) {
+                    if (e.lengthComputable) {
+                        const percent = Math.round((e.loaded / e.total) * 100);
+                        progressBar.style.width = (percent * 0.4) + '%'; // 40% reservado para subida
+                        statusPercent.textContent = Math.round(percent * 0.4) + '%';
+                        statusText.textContent = 'Subiendo catálogo al servidor...';
+                    }
+                };
 
-            function resetStatus() {
-                if (processInterval) clearInterval(processInterval);
-                statusContainer.classList.add('hidden');
-                progressBar.style.width = '0%';
-                statusPercent.textContent = '0%';
+                xhr.onload = function() {
+                    if (xhr.status === 200) {
+                        progressBar.style.width = '100%';
+                        statusPercent.textContent = '100%';
+                        statusText.textContent = '¡Listo! Descargando tu archivo...';
+                        
+                        // Crear enlace de descarga con el binario recibido
+                        const blob = new Blob([xhr.response], { type: 'application/pdf' });
+                        const link = document.createElement('a');
+                        link.href = window.URL.createObjectURL(blob);
+                        link.download = 'catalogo_pyg.pdf';
+                        document.body.appendChild(link);
+                        link.click();
+                        document.body.removeChild(link);
+                        
+                        setTimeout(resetStatus, 3000);
+                    } else {
+                        alert('Error al procesar el PDF. Por favor verifica el formato del archivo.');
+                        resetStatus();
+                    }
+                };
+
+                xhr.onerror = function() {
+                    alert('Ocurrió un error en la conexión.');
+                    resetStatus();
+                };
+
+                xhr.responseType = 'blob';
+                
+                // Simular el backend procesando (incrementando barra del 40% al 90% mientras esperamos)
+                let processPercent = 40;
+                const interval = setInterval(() => {
+                    if (processPercent < 95) {
+                        processPercent += 5;
+                        progressBar.style.width = processPercent + '%';
+                        statusPercent.textContent = processPercent + '%';
+                        statusText.textContent = 'Procesando coordenadas de precios y sobreescribiendo...';
+                    } else {
+                        clearInterval(interval);
+                    }
+                }, 400);
+
+                xhr.send(formData);
+
+                function resetStatus() {
+                    clearInterval(interval);
+                    statusContainer.classList.add('hidden');
+                    progressBar.style.width = '0%';
+                    statusPercent.textContent = '0%';
+                    submitBtn.disabled = false;
+                    submitBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+                }
+
+            } catch (err) {
+                console.error(err);
+                alert('Ocurrió un error en el envío.');
                 submitBtn.disabled = false;
                 submitBtn.classList.remove('opacity-50', 'cursor-not-allowed');
             }
-
-            const xhr = new XMLHttpRequest();
-            xhr.open('POST', '/convert', true);
-            xhr.responseType = 'blob';
-            xhr.timeout = 600000; // 10 min de margen para catálogos pesados
-
-            // Progreso REAL de subida (0% a 40%)
-            xhr.upload.onprogress = function(ev) {
-                if (ev.lengthComputable) {
-                    const percent = Math.round((ev.loaded / ev.total) * 100);
-                    progressBar.style.width = (percent * 0.4) + '%';
-                    statusPercent.textContent = Math.round(percent * 0.4) + '%';
-                    const mb = (ev.loaded / 1048576).toFixed(1);
-                    const totalMb = (ev.total / 1048576).toFixed(1);
-                    statusText.textContent = 'Subiendo catálogo... ' + mb + ' / ' + totalMb + ' MB';
-                }
-            };
-
-            // Terminó la subida: ahora el servidor procesa (40% a 95% simulado)
-            xhr.upload.onload = function() {
-                progressBar.style.width = '45%';
-                statusPercent.textContent = '45%';
-                statusText.textContent = 'Procesando precios en el servidor...';
-                let processPercent = 45;
-                processInterval = setInterval(() => {
-                    if (processPercent < 95) {
-                        processPercent += 3;
-                        progressBar.style.width = processPercent + '%';
-                        statusPercent.textContent = processPercent + '%';
-                    } else {
-                        clearInterval(processInterval);
-                    }
-                }, 500);
-            };
-
-            xhr.onload = async function() {
-                if (processInterval) clearInterval(processInterval);
-                const ct = xhr.getResponseHeader('Content-Type') || '';
-                if (xhr.status === 200 && ct.indexOf('application/pdf') !== -1) {
-                    progressBar.style.width = '100%';
-                    statusPercent.textContent = '100%';
-                    statusText.textContent = '¡Listo! Descargando tu archivo...';
-                    const url = window.URL.createObjectURL(xhr.response);
-                    const link = document.createElement('a');
-                    link.href = url;
-                    link.download = 'catalogo_guaranies.pdf';
-                    document.body.appendChild(link);
-                    link.click();
-                    document.body.removeChild(link);
-                    setTimeout(() => window.URL.revokeObjectURL(url), 4000);
-                    setTimeout(resetStatus, 3000);
-                } else {
-                    // Mostramos el mensaje REAL del servidor (no un genérico)
-                    let msg = 'No se pudo procesar el archivo.';
-                    try { msg = (await xhr.response.text()) || msg; } catch (_) {}
-                    if (xhr.status === 413) {
-                        msg = 'El PDF es demasiado grande para el servidor. Probá comprimirlo o dividirlo.';
-                    } else if (xhr.status === 0) {
-                        msg = 'Se cortó la conexión durante la subida. Probá con una conexión más estable.';
-                    }
-                    alert('Error (' + xhr.status + '): ' + msg);
-                    resetStatus();
-                }
-            };
-
-            xhr.onerror = function() {
-                if (processInterval) clearInterval(processInterval);
-                alert('Se interrumpió la conexión con el servidor. Revisá tu internet y volvé a intentar.');
-                resetStatus();
-            };
-
-            xhr.ontimeout = function() {
-                if (processInterval) clearInterval(processInterval);
-                alert('La operación tardó demasiado y se canceló. Probá con un PDF más liviano o mejor conexión.');
-                resetStatus();
-            };
-
-            statusText.textContent = 'Subiendo catálogo...';
-            xhr.send(formData);
         });
     </script>
 </body>
 </html>
 '''
 
-
-LOCAL_HTML = r'''
-<!DOCTYPE html>
-<html lang="es" class="dark">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Conversor de Catálogos (Local) ARS ➔ PYG</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
-    <style>
-        body { background-color: #0f172a; color: #f8fafc; }
-    </style>
-</head>
-<body class="min-h-screen flex flex-col font-sans">
-    <header class="border-b border-slate-800 bg-slate-900/50 backdrop-blur py-4 px-6">
-        <div class="max-w-3xl mx-auto flex justify-between items-center">
-            <div class="flex items-center gap-3">
-                <div class="p-2 bg-emerald-600/20 text-emerald-400 rounded-lg">
-                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
-                </div>
-                <div>
-                    <h1 class="text-lg font-bold tracking-tight">Conversor Local (en tu navegador)</h1>
-                    <p class="text-xs text-slate-400">Procesa el PDF en tu equipo · sin subir nada · sin límites de servidor</p>
-                </div>
-            </div>
-            <a href="/" class="text-xs bg-slate-800 text-slate-300 px-3 py-1.5 rounded-full hover:bg-slate-700">Versión servidor</a>
-        </div>
-    </header>
-
-    <main class="flex-grow max-w-3xl w-full mx-auto p-6">
-        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-6">
-            <div>
-                <h2 class="text-xl font-semibold mb-1">Convertí tu catálogo sin subirlo</h2>
-                <p class="text-sm text-slate-400">Todo se procesa acá, en tu navegador. Ideal para PDFs pesados.</p>
-            </div>
-
-            <div>
-                <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Tasa de cambio (1 $ = X Gs.)</label>
-                <div class="relative rounded-lg">
-                    <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none"><span class="text-slate-500">₲</span></div>
-                    <input type="number" step="0.01" id="rate" value="7.80" class="block w-full pl-8 pr-3 py-2.5 bg-slate-950 border border-slate-800 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-500 text-white font-mono">
-                </div>
-            </div>
-
-            <div>
-                <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Archivo PDF del catálogo</label>
-                <div id="dropZone" class="border-2 border-dashed border-slate-800 hover:border-slate-700 bg-slate-950/50 rounded-xl p-8 text-center cursor-pointer transition-colors group">
-                    <input type="file" id="fileInput" accept="application/pdf" class="hidden">
-                    <div class="space-y-3">
-                        <svg class="mx-auto h-10 w-10 text-slate-500 group-hover:text-emerald-400 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path></svg>
-                        <div class="text-sm text-slate-300"><span class="font-medium text-emerald-500 group-hover:underline">Hacé clic para elegir</span> o arrastrá tu PDF acá</div>
-                        <p class="text-xs text-slate-500" id="fileNameDisplay">Solo archivos PDF</p>
-                    </div>
-                </div>
-            </div>
-
-            <button id="submitBtn" class="w-full bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white py-3 px-4 rounded-xl font-medium transition-all flex justify-center items-center gap-2">
-                <span id="btnText">Convertir Catálogo</span>
-            </button>
-
-            <div id="statusContainer" class="hidden space-y-3">
-                <div class="flex justify-between text-xs font-medium">
-                    <span id="statusText" class="text-slate-400">Procesando...</span>
-                    <span id="statusPercent" class="text-emerald-500 font-mono">0%</span>
-                </div>
-                <div class="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
-                    <div id="progressBar" class="bg-emerald-500 h-full w-0 transition-all duration-200"></div>
-                </div>
-            </div>
-
-            <div id="resultBox" class="hidden bg-emerald-950/40 border border-emerald-700/50 rounded-xl p-4">
-                <p id="resultText" class="text-sm text-emerald-300 font-medium mb-3"></p>
-                <a id="downloadLink" class="inline-flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-lg text-sm font-medium cursor-pointer">
-                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
-                    Descargar PDF convertido
-                </a>
-            </div>
-
-            <div id="errorBox" class="hidden bg-red-950/40 border border-red-700/50 rounded-xl p-4 text-sm text-red-300"></div>
-        </div>
-    </main>
-
-    <script>
-        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-        const { PDFDocument, StandardFonts, rgb } = PDFLib;
-
-        const dropZone = document.getElementById('dropZone');
-        const fileInput = document.getElementById('fileInput');
-        const fileNameDisplay = document.getElementById('fileNameDisplay');
-        const submitBtn = document.getElementById('submitBtn');
-        const btnText = document.getElementById('btnText');
-        const statusContainer = document.getElementById('statusContainer');
-        const statusText = document.getElementById('statusText');
-        const statusPercent = document.getElementById('statusPercent');
-        const progressBar = document.getElementById('progressBar');
-        const resultBox = document.getElementById('resultBox');
-        const resultText = document.getElementById('resultText');
-        const downloadLink = document.getElementById('downloadLink');
-        const errorBox = document.getElementById('errorBox');
-
-        let selectedFile = null;
-
-        ['dragenter','dragover'].forEach(ev => dropZone.addEventListener(ev, e => { e.preventDefault(); dropZone.classList.add('border-emerald-500'); }));
-        ['dragleave','drop'].forEach(ev => dropZone.addEventListener(ev, e => { e.preventDefault(); dropZone.classList.remove('border-emerald-500'); }));
-        dropZone.addEventListener('drop', e => { if (e.dataTransfer.files.length) setFile(e.dataTransfer.files[0]); });
-        dropZone.addEventListener('click', () => fileInput.click());
-        fileInput.addEventListener('change', () => { if (fileInput.files.length) setFile(fileInput.files[0]); });
-
-        function setFile(f) {
-            selectedFile = f;
-            fileNameDisplay.textContent = f.name;
-            fileNameDisplay.classList.add('text-emerald-400');
-            resultBox.classList.add('hidden');
-            errorBox.classList.add('hidden');
-        }
-
-        function setProgress(p, txt) {
-            statusContainer.classList.remove('hidden');
-            const pct = Math.round(p * 100);
-            progressBar.style.width = pct + '%';
-            statusPercent.textContent = pct + '%';
-            if (txt) statusText.textContent = txt;
-        }
-
-        submitBtn.addEventListener('click', async () => {
-            if (!selectedFile) { alert('Elegí un archivo PDF primero.'); return; }
-            const rate = parseFloat(String(document.getElementById('rate').value).replace(',', '.'));
-            if (!rate || rate <= 0) { alert('Ingresá una tasa de cambio válida.'); return; }
-
-            submitBtn.disabled = true;
-            btnText.textContent = 'Procesando...';
-            resultBox.classList.add('hidden');
-            errorBox.classList.add('hidden');
-            setProgress(0.01, 'Leyendo el catálogo...');
-
-            try {
-                const bytes = new Uint8Array(await selectedFile.arrayBuffer());
-                const { outBytes, convertidos } = await convertirLocal(bytes, rate, (p, t) => setProgress(p, t));
-
-                setProgress(1, '¡Listo!');
-                const blob = new Blob([outBytes], { type: 'application/pdf' });
-                const url = URL.createObjectURL(blob);
-                downloadLink.href = url;
-                downloadLink.download = (selectedFile.name.replace(/\.pdf$/i, '')) + '_guaranies.pdf';
-                resultText.textContent = '¡Listo! ' + convertidos + ' precios convertidos.';
-                resultBox.classList.remove('hidden');
-            } catch (err) {
-                console.error(err);
-                errorBox.textContent = 'Error: ' + (err && err.message ? err.message : err);
-                errorBox.classList.remove('hidden');
-            } finally {
-                submitBtn.disabled = false;
-                btnText.textContent = 'Convertir Catálogo';
-                setTimeout(() => statusContainer.classList.add('hidden'), 1500);
-            }
-        });
-
-        // ---- Motor de conversión (equivalente al de Python, pero en el navegador) ----
-
-        const PRECIO_RE = /\$\s*([\d.,]+)/g;
-
-        function formatoMiles(n) {
-            return n.toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g, '.');
-        }
-
-        function agruparLineas(items) {
-            const arr = items.filter(it => it.str && it.str.length)
-                .sort((a, b) => {
-                    const dy = b.transform[5] - a.transform[5];
-                    if (Math.abs(dy) > 2) return dy;
-                    return a.transform[4] - b.transform[4];
-                });
-            const lineas = [];
-            for (const it of arr) {
-                const y = it.transform[5];
-                const tol = Math.max(2, (it.height || 10) * 0.5);
-                let linea = lineas.find(l => Math.abs(l.y - y) <= tol);
-                if (!linea) { linea = { y: y, items: [] }; lineas.push(linea); }
-                linea.items.push(it);
-            }
-            for (const l of lineas) l.items.sort((a, b) => a.transform[4] - b.transform[4]);
-            return lineas;
-        }
-
-        function rectAcanvas(viewport, x0, y0, x1, y1) {
-            const p1 = viewport.convertToViewportPoint(x0, y0);
-            const p2 = viewport.convertToViewportPoint(x1, y1);
-            return {
-                cx0: Math.min(p1[0], p2[0]), cy0: Math.min(p1[1], p2[1]),
-                cx1: Math.max(p1[0], p2[0]), cy1: Math.max(p1[1], p2[1]),
-            };
-        }
-
-        function colorDominante(data, w, h, cx0, cy0, cx1, cy1, ignore) {
-            const counts = new Map();
-            const x0 = Math.max(0, Math.floor(cx0)), x1 = Math.min(w - 1, Math.ceil(cx1));
-            const y0 = Math.max(0, Math.floor(cy0)), y1 = Math.min(h - 1, Math.ceil(cy1));
-            for (let y = y0; y <= y1; y++) {
-                for (let x = x0; x <= x1; x++) {
-                    const i = (y * w + x) * 4;
-                    const r = data[i], g = data[i + 1], b = data[i + 2];
-                    if (ignore) {
-                        const d = Math.abs(r - ignore.r) + Math.abs(g - ignore.g) + Math.abs(b - ignore.b);
-                        if (d < 100) continue;
-                    }
-                    const key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
-                    counts.set(key, (counts.get(key) || 0) + 1);
-                }
-            }
-            if (!counts.size) return null;
-            let bestKey = 0, bestCount = -1;
-            for (const [k, c] of counts) { if (c > bestCount) { bestCount = c; bestKey = k; } }
-            return {
-                r: ((bestKey >> 10) & 31) << 3,
-                g: ((bestKey >> 5) & 31) << 3,
-                b: (bestKey & 31) << 3,
-            };
-        }
-
-        function asegurarContraste(text, bg) {
-            const d = Math.abs(text.r - bg.r) + Math.abs(text.g - bg.g) + Math.abs(text.b - bg.b);
-            if (d >= 120) return text;
-            const lum = 0.299 * bg.r + 0.587 * bg.g + 0.114 * bg.b;
-            return lum > 140 ? { r: 0, g: 0, b: 0 } : { r: 255, g: 255, b: 255 };
-        }
-
-        async function convertirLocal(fileBytes, rate, onProgress) {
-            // pdf.js "transfiere" (vacía) el buffer al procesarlo, así que le damos
-            // una copia a cada librería para que pdf-lib no reciba bytes vacíos.
-            const bytesParaLib = fileBytes.slice(0);
-            const tarea = pdfjsLib.getDocument({ data: fileBytes.slice(0) });
-            const pdfjsDoc = await tarea.promise;
-            const pdfDoc = await PDFDocument.load(bytesParaLib, { ignoreEncryption: true });
-            const helv = await pdfDoc.embedFont(StandardFonts.Helvetica);
-            const helvBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-            const paginasLib = pdfDoc.getPages();
-
-            const total = pdfjsDoc.numPages;
-            let convertidos = 0;
-
-            for (let n = 1; n <= total; n++) {
-                const page = await pdfjsDoc.getPage(n);
-                const contenido = await page.getTextContent();
-                onProgress(n / total, 'Procesando página ' + n + ' de ' + total + '...');
-
-                if (!contenido.items.some(it => it.str && it.str.includes('$'))) continue;
-
-                // Render de la página para muestrear colores reales.
-                const escala = 1.5;
-                const viewport = page.getViewport({ scale: escala });
-                const canvas = document.createElement('canvas');
-                canvas.width = Math.ceil(viewport.width);
-                canvas.height = Math.ceil(viewport.height);
-                const ctx = canvas.getContext('2d', { willReadFrequently: true });
-                // Fondo blanco (como PyMuPDF alpha=False): evita que las zonas sin
-                // relleno se muestreen como negro.
-                ctx.fillStyle = '#FFFFFF';
-                ctx.fillRect(0, 0, canvas.width, canvas.height);
-                await page.render({ canvasContext: ctx, viewport: viewport, background: 'rgb(255,255,255)' }).promise;
-                const img = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
-                const W = canvas.width, H = canvas.height;
-
-                const pl = paginasLib[n - 1];
-                const lineas = agruparLineas(contenido.items);
-                const ediciones = [];
-
-                for (const linea of lineas) {
-                    const texto = linea.items.map(i => i.str).join('');
-                    if (!texto.includes('$')) continue;
-
-                    const rangos = [];
-                    let pos = 0;
-                    for (const it of linea.items) { rangos.push([pos, pos + it.str.length, it]); pos += it.str.length; }
-                    const esTachado = /P\.?REG/i.test(texto);
-
-                    PRECIO_RE.lastIndex = 0;
-                    let m;
-                    while ((m = PRECIO_RE.exec(texto)) !== null) {
-                        const nums = (m[1].match(/\d+/g) || []).join('');
-                        if (!nums) continue;
-                        const mStart = m.index, mEnd = m.index + m[0].length;
-
-                        // Calculamos el rectángulo EXACTO del precio dentro de cada
-                        // bloque de texto (por proporción de caracteres), así no
-                        // tapamos rótulos como "P.REG." u "OFERTA" que estén pegados.
-                        let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-                        let ref = null;
-                        for (const r of rangos) {
-                            const a = r[0], b = r[1], it = r[2];
-                            if (!(a < mEnd && b > mStart)) continue;
-                            const len = Math.max(1, b - a);
-                            const localIni = Math.max(a, mStart) - a;
-                            const localFin = Math.min(b, mEnd) - a;
-                            const iw = it.width;
-                            const left = it.transform[4] + (localIni / len) * iw;
-                            const right = it.transform[4] + (localFin / len) * iw;
-                            const iy = it.transform[5];
-                            const fh = Math.hypot(it.transform[2], it.transform[3]) || it.height || 10;
-                            x0 = Math.min(x0, left); x1 = Math.max(x1, right);
-                            y0 = Math.min(y0, iy - fh * 0.22); y1 = Math.max(y1, iy + fh * 0.82);
-                            if (!ref || it.str.includes('$')) ref = it;
-                        }
-                        if (!ref || !(x1 - x0 > 0.5 && y1 - y0 > 0.5)) continue;
-
-                        const precioArs = parseFloat(nums);
-                        const precioPyg = Math.round(precioArs * rate / 100) * 100;
-                        const nuevoTexto = 'Gs. ' + formatoMiles(precioPyg);
-
-                        const fh = Math.hypot(ref.transform[2], ref.transform[3]) || ref.height || 10;
-                        const esNegrita = /bold|black|heavy/i.test(ref.fontName || '');
-                        let font = esNegrita ? helvBold : helv;
-                        let fontSize = fh;
-                        const anchoOrig = x1 - x0;
-                        let ancho = font.widthOfTextAtSize(nuevoTexto, fontSize);
-                        if (ancho > anchoOrig && ancho > 0) { fontSize *= anchoOrig / ancho; ancho = font.widthOfTextAtSize(nuevoTexto, fontSize); }
-
-                        // Colores desde el canvas.
-                        const c = rectAcanvas(viewport, x0, y0, x1, y1);
-                        const pad = Math.round(4 * escala);
-                        const bg = colorDominante(img, W, H, c.cx0 - pad, c.cy0 - pad, c.cx1 + pad, c.cy1 + pad, null) || { r: 255, g: 255, b: 255 };
-                        let textColor = colorDominante(img, W, H, c.cx0, c.cy0, c.cx1, c.cy1, bg) || { r: 20, g: 20, b: 20 };
-                        textColor = asegurarContraste(textColor, bg);
-
-                        ediciones.push({
-                            x0: x0, y0: y0, x1: x1, y1: y1,
-                            bg: bg, textColor: textColor,
-                            nuevoTexto: nuevoTexto, font: font, fontSize: fontSize,
-                            baseline: ref.transform[5], ancho: ancho, esTachado: esTachado,
-                        });
-                        convertidos++;
-                    }
-                }
-
-                // Paso 1: tapamos TODOS los precios originales primero (pdf-lib usa
-                // origen abajo-izquierda, Y hacia arriba).
-                for (const e of ediciones) {
-                    pl.drawRectangle({
-                        x: e.x0 - 1, y: e.y0, width: (e.x1 - e.x0) + 2, height: (e.y1 - e.y0),
-                        color: rgb(e.bg.r / 255, e.bg.g / 255, e.bg.b / 255),
-                    });
-                }
-                // Paso 2: dibujamos los precios nuevos encima (y el tachado).
-                for (const e of ediciones) {
-                    pl.drawText(e.nuevoTexto, {
-                        x: e.x0, y: e.baseline, size: e.fontSize, font: e.font,
-                        color: rgb(e.textColor.r / 255, e.textColor.g / 255, e.textColor.b / 255),
-                    });
-                    if (e.esTachado) {
-                        const yStrike = e.baseline + e.fontSize * 0.28;
-                        pl.drawLine({
-                            start: { x: e.x0, y: yStrike }, end: { x: e.x0 + e.ancho, y: yStrike },
-                            thickness: Math.max(0.6, e.fontSize * 0.06),
-                            color: rgb(e.textColor.r / 255, e.textColor.g / 255, e.textColor.b / 255),
-                        });
-                    }
-                }
-
-                canvas.width = 0; canvas.height = 0;
-                page.cleanup();
-                await new Promise(r => setTimeout(r, 0));
-            }
-
-            const outBytes = await pdfDoc.save();
-            return { outBytes: outBytes, convertidos: convertidos };
-        }
-    </script>
-</body>
-</html>
-'''
-
-
-
-
-@app.route('/local')
-def local():
-    return render_template_string(LOCAL_HTML)
+@app.route('/')
+def home():
+    return render_template_string(HTML_TEMPLATE)
 
 @app.route('/convert', methods=['POST'])
 def convert():
     if 'file' not in request.files:
-        return "No se recibió ningún archivo.", 400
-
+        return "No file uploaded", 400
+    
     file = request.files['file']
-    if not file or file.filename == '':
-        return "No se seleccionó ningún archivo.", 400
+    rate_val = float(request.form.get('rate', 7.80))
+    
+    if file.filename == '':
+        return "No file selected", 400
 
-    # Nombre seguro (evita path traversal) y validación de extensión.
-    nombre_seguro = secure_filename(file.filename) or "catalogo.pdf"
-    if not nombre_seguro.lower().endswith('.pdf'):
-        return "El archivo debe ser un PDF (.pdf).", 400
-
-    # Tasa de cambio robusta (acepta coma o punto).
-    try:
-        rate_val = float(str(request.form.get('rate', '7.80')).replace(',', '.'))
-        if rate_val <= 0:
-            raise ValueError
-    except (TypeError, ValueError):
-        return "La tasa de cambio ingresada no es válida.", 400
-
-    # Nombres únicos: evita colisiones si entran dos subidas a la vez.
-    unico = uuid.uuid4().hex
-    input_path = os.path.join(app.config['UPLOAD_FOLDER'], f"in_{unico}.pdf")
-    output_path = os.path.join(app.config['UPLOAD_FOLDER'], f"out_{unico}.pdf")
-
+    input_path = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
+    output_path = os.path.join(app.config['UPLOAD_FOLDER'], "converted_" + file.filename)
+    
     file.save(input_path)
-
-    # Validamos que el archivo recibido sea realmente un PDF. Si la subida se
-    # cortó a mitad (conexión inestable), el archivo llega incompleto/corrupto
-    # y lo detectamos acá con un mensaje claro en lugar de un error genérico.
-    try:
-        tam = os.path.getsize(input_path)
-        with open(input_path, 'rb') as fh:
-            cabecera = fh.read(5)
-        if tam == 0 or not cabecera.startswith(b'%PDF'):
-            os.remove(input_path)
-            return ("La subida se cortó o el archivo no es un PDF válido. "
-                    "Volvé a intentarlo con una conexión estable."), 400
-    except OSError:
-        return "No se pudo leer el archivo subido. Intentá de nuevo.", 400
-
+    
     doc = None
     try:
         # Abrimos el PDF original
@@ -962,13 +505,7 @@ def convert():
                         width=max(0.6, e["fontsize"] * 0.06),
                     )
 
-            # Liberamos la memoria de la página antes de pasar a la siguiente
-            # (clave en el plan free de 512 MB con catálogos pesados).
-            data = None
-            ediciones = None
-            gc.collect()
-
-        doc.save(output_path, garbage=1, deflate=True)
+        doc.save(output_path, garbage=4, deflate=True)
 
         
         return send_file(output_path, as_attachment=True, download_name="catalogo_guaranies.pdf")
